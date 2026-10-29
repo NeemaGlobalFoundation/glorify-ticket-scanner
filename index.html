@@ -1,0 +1,350 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Glorify | Ticket Scanner</title>
+  <script src="https://unpkg.com/html5-qrcode"></script>
+  <style>
+    *{box-sizing:border-box}
+    body{
+      margin:0;padding:20px;background:#09090d;color:#fff;
+      font-family:Arial, sans-serif;min-height:100vh;
+    }
+    .container{max-width:520px;margin:25px auto}
+    .header{text-align:center;margin-bottom:25px}
+    .logo{font-size:30px;font-weight:900;letter-spacing:2px}
+    .logo span{color:#e63946}
+    .subtitle{color:#aaa;font-size:13px;margin-top:8px}
+    .card{
+      background:#15151d;border:1px solid #292934;
+      border-radius:18px;padding:20px;margin-bottom:16px;
+    }
+    h2{font-size:17px;margin:0 0 15px}
+    #reader{
+      width:100%;overflow:hidden;border-radius:12px;
+      background:#08080b;
+    }
+    button{
+      width:100%;border:0;border-radius:10px;padding:15px;
+      font-weight:bold;font-size:15px;cursor:pointer;margin-top:10px;
+    }
+    .primary{background:#e63946;color:white}
+    .secondary{background:#292934;color:white}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    input{
+      width:100%;padding:14px;margin-top:9px;
+      background:#09090d;border:1px solid #383844;
+      border-radius:9px;color:white;font-size:16px;
+    }
+    label{font-size:13px;color:#bbb;display:block;margin-top:15px}
+    .status{
+      padding:13px;border-radius:10px;margin-top:13px;
+      background:#252530;color:#ddd;font-size:14px;
+    }
+    .success{background:#123c29;color:#8cf0b2}
+    .error{background:#451b22;color:#ff9da6}
+    .warning{background:#463619;color:#ffdc8a}
+    .detail{font-size:14px;color:#ccc;line-height:1.8}
+    .detail strong{color:#fff}
+    .hidden{display:none}
+    .footer{text-align:center;color:#777;font-size:11px;margin-top:25px}
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <div class="header">
+    <div class="logo">GLORIFY<span>.</span></div>
+    <div class="subtitle">LIVE RECORDING · STAFF TICKET SCANNER</div>
+  </div>
+
+  <div class="card">
+    <h2>Scan ticket QR code</h2>
+    <div id="reader"></div>
+    <button class="primary" id="startBtn" onclick="startScanner()">START CAMERA SCANNER</button>
+    <button class="secondary" id="stopBtn" onclick="stopScanner()" disabled>STOP CAMERA</button>
+    <div class="subtitle" style="margin-top:12px">
+      Allow camera access when your browser asks.
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Enter ticket manually</h2>
+    <input id="ticketInput" placeholder="Paste or enter ticket ID">
+    <button class="secondary" onclick="lookupManual()">CHECK TICKET</button>
+  </div>
+
+  <div id="resultCard" class="card hidden">
+    <h2>Ticket information</h2>
+    <div id="ticketDetails" class="detail"></div>
+    <div id="message" class="status">Waiting for ticket...</div>
+
+    <div id="staffSection" class="hidden">
+      <label for="staffPin">Staff check-in PIN</label>
+      <input id="staffPin" type="password" inputmode="numeric"
+             placeholder="Enter staff PIN">
+      <button class="secondary" onclick="verifyTicket()">VERIFY STAFF PIN</button>
+      <button class="primary" id="checkInBtn" onclick="checkInTicket()" disabled>
+        ADMIT / CHECK IN TICKET
+      </button>
+    </div>
+  </div>
+
+  <div class="footer">GLORIFY LIVE RECORDING · OFFICIAL STAFF SYSTEM</div>
+</div>
+
+<script>
+const WORKER_URL =
+  "https://gentle-butterfly-b720.wangarisamuelmwangi8.workers.dev";
+
+let scanner = null;
+let currentTicketId = "";
+let currentTicket = null;
+let pinVerified = false;
+let busy = false;
+
+function showMessage(text, type="") {
+  const box = document.getElementById("message");
+  box.textContent = text;
+  box.className = "status " + type;
+}
+
+function extractTicketId(value) {
+  value = String(value || "").trim();
+
+  try {
+    const url = new URL(value);
+    const possible =
+      url.searchParams.get("ticket") ||
+      url.searchParams.get("ticketId") ||
+      url.searchParams.get("id");
+
+    if (possible) return possible.trim();
+  } catch(e) {}
+
+  return value;
+}
+
+async function apiRequest(payload) {
+  const response = await fetch(WORKER_URL, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(result.message || "Server connection failed.");
+  }
+
+  return result;
+}
+
+async function startScanner() {
+  if (scanner) return;
+
+  try {
+    scanner = new Html5Qrcode("reader");
+
+    const cameras = await Html5Qrcode.getCameras();
+
+    if (!cameras || cameras.length === 0) {
+      throw new Error("No camera found on this device.");
+    }
+
+    const camera = cameras.find(c =>
+      /back|rear|environment/i.test(c.label)
+    ) || cameras[cameras.length - 1];
+
+    await scanner.start(
+      camera.id,
+      {fps:10, qrbox:{width:250,height:250}},
+      async decodedText => {
+        if (busy) return;
+        busy = true;
+        await stopScanner();
+        await lookupTicket(extractTicketId(decodedText));
+        busy = false;
+      },
+      () => {}
+    );
+
+    document.getElementById("startBtn").disabled = true;
+    document.getElementById("stopBtn").disabled = false;
+
+  } catch(error) {
+    scanner = null;
+    showCameraError(error);
+  }
+}
+
+async function stopScanner() {
+  if (scanner) {
+    try {
+      if (scanner.isScanning) await scanner.stop();
+      await scanner.clear();
+    } catch(e) {}
+    scanner = null;
+  }
+
+  document.getElementById("startBtn").disabled = false;
+  document.getElementById("stopBtn").disabled = true;
+}
+
+function showCameraError(error) {
+  document.getElementById("resultCard").classList.remove("hidden");
+  showMessage(
+    error.message || "Could not start camera. Check browser permissions.",
+    "error"
+  );
+}
+
+function lookupManual() {
+  const value = document.getElementById("ticketInput").value;
+  lookupTicket(extractTicketId(value));
+}
+
+async function lookupTicket(ticketId) {
+  ticketId = String(ticketId || "").trim();
+
+  if (!ticketId) {
+    document.getElementById("resultCard").classList.remove("hidden");
+    showMessage("Please scan or enter a ticket ID.", "error");
+    return;
+  }
+
+  currentTicketId = ticketId;
+  currentTicket = null;
+  pinVerified = false;
+
+  document.getElementById("resultCard").classList.remove("hidden");
+  document.getElementById("staffSection").classList.add("hidden");
+  document.getElementById("checkInBtn").disabled = true;
+  document.getElementById("ticketDetails").innerHTML = "";
+  showMessage("Checking ticket...", "");
+
+  try {
+    const data = await apiRequest({
+      action:"lookupTicketForScanner",
+      ticketId:ticketId
+    });
+
+    if (!data.ok) {
+      showMessage(data.message || "Ticket not found.", "error");
+      return;
+    }
+
+    currentTicket = data;
+
+    document.getElementById("ticketDetails").innerHTML = `
+      <strong>Ticket ID:</strong> ${escapeHTML(data.ticketId || ticketId)}<br>
+      <strong>Category:</strong> ${escapeHTML(data.category || "-")}<br>
+      <strong>Email:</strong> ${escapeHTML(data.maskedEmail || "-")}<br>
+      <strong>Payment:</strong> ${escapeHTML(data.paymentStatus || "-")}<br>
+      <strong>Ticket status:</strong> ${escapeHTML(data.ticketStatus || "-")}<br>
+      <strong>Checked in:</strong> ${escapeHTML(data.checkedInAt || "Not yet")}
+    `;
+
+    const payment = String(data.paymentStatus || "").toUpperCase();
+    const status = String(data.ticketStatus || "").toUpperCase();
+
+    if (payment !== "PAID") {
+      showMessage("PAYMENT NOT CONFIRMED. DO NOT ADMIT.", "error");
+    } else if (status === "USED") {
+      showMessage("TICKET ALREADY USED. DO NOT ADMIT AGAIN.", "error");
+    } else if (status !== "ACTIVE") {
+      showMessage("TICKET IS NOT ACTIVE. DO NOT ADMIT.", "error");
+    } else {
+      showMessage("VALID TICKET. Enter staff PIN to continue.", "success");
+      document.getElementById("staffSection").classList.remove("hidden");
+    }
+
+  } catch(error) {
+    showMessage(error.message || "Could not connect to scanner server.", "error");
+  }
+}
+
+async function verifyTicket() {
+  const pin = document.getElementById("staffPin").value.trim();
+
+  if (!pin) {
+    showMessage("Enter your staff PIN first.", "error");
+    return;
+  }
+
+  showMessage("Verifying staff PIN...", "");
+
+  try {
+    const data = await apiRequest({
+      action:"verifyTicketForScanner",
+      ticketId:currentTicketId,
+      pin:pin
+    });
+
+    if (!data.ok) {
+      pinVerified = false;
+      document.getElementById("checkInBtn").disabled = true;
+      showMessage(data.message || "PIN verification failed.", "error");
+      return;
+    }
+
+    pinVerified = true;
+    showMessage("PIN verified. You may now check in this ticket.", "success");
+    document.getElementById("checkInBtn").disabled = false;
+
+  } catch(error) {
+    showMessage(error.message || "PIN verification failed.", "error");
+  }
+}
+
+async function checkInTicket() {
+  if (!pinVerified || !currentTicketId) return;
+
+  const pin = document.getElementById("staffPin").value.trim();
+  const button = document.getElementById("checkInBtn");
+
+  button.disabled = true;
+  showMessage("Processing check-in...", "");
+
+  try {
+    const data = await apiRequest({
+      action:"checkInTicketForScanner",
+      ticketId:currentTicketId,
+      pin:pin
+    });
+
+    if (!data.ok) {
+      showMessage(data.message || "Check-in failed.", "error");
+      button.disabled = false;
+      return;
+    }
+
+    showMessage("SUCCESS! TICKET CHECKED IN. ADMIT GUEST.", "success");
+    document.getElementById("ticketDetails").innerHTML +=
+      `<br><strong>Guest:</strong> ${escapeHTML(data.name || "-")}`;
+
+    pinVerified = false;
+    document.getElementById("staffSection").classList.add("hidden");
+    document.getElementById("staffPin").value = "";
+
+  } catch(error) {
+    showMessage(error.message || "Check-in failed. Please check the ticket status.", "error");
+    button.disabled = false;
+  }
+}
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&":"&amp;",
+    "<":"&lt;",
+    ">":"&gt;",
+    '"':"&quot;",
+    "'":"&#039;"
+  })[char]);
+}
+</script>
+</body>
+</html>
